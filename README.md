@@ -61,7 +61,19 @@ To start the MCP server, run:
 npm run dev
 ```
 
-The server will be available at `http://localhost:3000` (or the configured port).
+By default the connector exposes an MCP-compliant WebSocket endpoint at `ws://localhost:3000/mcp`. The following environment
+variables can be used to tweak the listener:
+
+| Variable   | Default     | Description |
+|------------|-------------|-------------|
+| `PORT`     | `3000`      | TCP port to bind the HTTP server. |
+| `HOST`     | `0.0.0.0`   | Interface address to bind the listener. |
+| `MCP_PATH` | `/mcp`      | HTTP path that upgrades to the MCP WebSocket transport. |
+
+The HTTP server also exposes a `GET /health` endpoint that can be used for readiness checks. Each WebSocket client must send an
+`initialize` request (per the Model Context Protocol) before issuing `tools/list` or `tools/call` requests. Tool invocations
+are streamed back to the client through `tools/stream` notifications followed by a terminal JSON-RPC response when the
+execution completes.
 
 ## 🧰 Implemented Tools
 

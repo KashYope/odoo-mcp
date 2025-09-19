@@ -3,6 +3,8 @@ import { odooConnector } from './odoo-connector';
 import { odooTools } from './tools';
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const HOST = process.env.HOST ?? '0.0.0.0';
+const PATH = process.env.MCP_PATH ?? '/mcp';
 
 /**
  * The main entry point for the application.
@@ -29,9 +31,39 @@ async function main() {
     console.log(`✅ Registered ${odooTools.length} Odoo tools.`);
 
     // 4. Start the server
-    host.listen({ port: PORT });
-    console.log(`👂 Server listening on http://localhost:${PORT}`);
+    const serverHandle = await host.listen({ port: PORT, host: HOST, path: PATH });
+    let shuttingDown = false;
+    console.log(`👂 Server listening on ws://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${serverHandle.port}${PATH}`);
     console.log('🎉 Odoo MCP Connector is ready to accept connections.');
+
+    const shutdown = async (reason: string, exitCode: number) => {
+      if (shuttingDown) {
+        return;
+      }
+      shuttingDown = true;
+      console.log(`🛑 Shutting down Odoo MCP Connector (${reason})...`);
+      try {
+        await serverHandle.close();
+      } catch (error) {
+        console.error('Error while closing MCP host:', error);
+      }
+      process.exit(exitCode);
+    };
+
+    const handleSignal = (signal: NodeJS.Signals) => {
+      void shutdown(signal, 0);
+    };
+
+    process.once('SIGINT', handleSignal);
+    process.once('SIGTERM', handleSignal);
+    process.once('uncaughtException', (error) => {
+      console.error('🔥 Uncaught exception:', error);
+      void shutdown('uncaughtException', 1);
+    });
+    process.once('unhandledRejection', (reason) => {
+      console.error('🔥 Unhandled rejection:', reason);
+      void shutdown('unhandledRejection', 1);
+    });
 
   } catch (error) {
     console.error('🔥 Failed to start the Odoo MCP Connector:', error);
