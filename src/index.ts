@@ -1,10 +1,6 @@
-import { Host, InMemoryEventStore } from '@modelcontextprotocol/sdk';
+import { Host, InMemoryEventStore } from './mcp';
 import { odooConnector } from './odoo-connector';
 import { odooTools } from './tools';
-import * as dotenv from 'dotenv';
-
-// Load environment variables
-dotenv.config();
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 

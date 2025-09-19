@@ -1,45 +1,305 @@
-import { Tool } from '@modelcontextprotocol/sdk';
-import { z } from 'zod';
+import { Tool } from './mcp';
 import { odooConnector } from './odoo-connector';
+import {
+  ALLOWED_MODELS,
+  BUSINESS_METHOD_WHITELIST,
+  DEFAULT_LIMIT,
+  MAX_LIMIT,
+  PII_FIELDS,
+  SAFE_MODELS,
+  WRITABLE_MODELS,
+} from './config';
 
-// Whitelist of models the LLM is allowed to interact with.
-// This is a critical security measure.
-const ALLOWED_MODELS = [
-  'res.partner',
-  'sale.order',
-  'account.move',
-  'product.product',
-  'stock.picking',
-  'mrp.production',
-];
+const EXECUTION_MODES = ['plan', 'dry_run', 'confirm'] as const;
+type ExecutionMode = (typeof EXECUTION_MODES)[number];
 
-/**
- * Tool to search for and read records from Odoo.
- * This is the primary method for getting data out of Odoo.
- */
+const executionModeSchema = {
+  type: 'string',
+  enum: EXECUTION_MODES,
+  description: 'Execution mode: plan, dry_run, or confirm.',
+};
+
+type SearchReadInput = {
+  model: string;
+  domain?: any[];
+  fields?: string[];
+  limit?: number;
+  order?: string;
+};
+
+type GetInput = {
+  model: string;
+  id: number;
+  fields?: string[];
+};
+
+type CountInput = {
+  model: string;
+  domain?: any[];
+};
+
+type CreateInput = {
+  model: string;
+  values: Record<string, any>;
+  mode: ExecutionMode;
+};
+
+type WriteInput = {
+  model: string;
+  ids: number | number[];
+  values: Record<string, any>;
+  mode: ExecutionMode;
+};
+
+type UnlinkInput = {
+  model: string;
+  ids: number | number[];
+  mode: ExecutionMode;
+};
+
+type CallKwInput = {
+  model: string;
+  method: string;
+  args?: any[];
+  kwargs?: Record<string, any>;
+  mode: ExecutionMode;
+};
+
+function assertModelAllowed(model: string): void {
+  if (!SAFE_MODELS.includes(model)) {
+    throw new Error(`Model "${model}" is not in the whitelist.`);
+  }
+}
+
+function assertModelWritable(model: string): void {
+  if (!WRITABLE_MODELS.includes(model)) {
+    throw new Error(`Model "${model}" is not allowed for write operations.`);
+  }
+}
+
+function ensureFieldsAllowed(model: string, requestedFields?: string[]): string[] {
+  const allowed = ALLOWED_MODELS[model].fields;
+  if (!requestedFields) {
+    return allowed;
+  }
+  if (!Array.isArray(requestedFields)) {
+    throw new Error('Fields must be provided as an array.');
+  }
+  const invalid = requestedFields.filter((field) => !allowed.includes(field));
+  if (invalid.length > 0) {
+    throw new Error(`Fields not allowed for model ${model}: ${invalid.join(', ')}`);
+  }
+  return requestedFields.length > 0 ? requestedFields : allowed;
+}
+
+function sanitizeOrder(model: string, order?: string): string | undefined {
+  if (!order) {
+    return undefined;
+  }
+  if (typeof order !== 'string') {
+    throw new Error('Order must be a string.');
+  }
+  const allowedFields = ALLOWED_MODELS[model].fields;
+  const clauses = order
+    .split(',')
+    .map((clause) => clause.trim())
+    .filter(Boolean);
+
+  const invalid = clauses.filter((clause) => {
+    const [field] = clause.split(' ');
+    return !allowedFields.includes(field);
+  });
+
+  if (invalid.length > 0) {
+    throw new Error(`Order clause references disallowed fields: ${invalid.join(', ')}`);
+  }
+
+  return clauses.join(', ');
+}
+
+function sanitizeValues(model: string, values: Record<string, any>): Record<string, any> {
+  if (values === null || typeof values !== 'object' || Array.isArray(values)) {
+    throw new Error('Values must be provided as an object.');
+  }
+  const allowedFields = new Set(ALLOWED_MODELS[model].fields);
+  const sanitizedEntries = Object.entries(values).filter(([field]) => allowedFields.has(field));
+  if (sanitizedEntries.length === 0) {
+    throw new Error(`No allowed fields provided for model ${model}.`);
+  }
+  return Object.fromEntries(sanitizedEntries);
+}
+
+function maskString(value: string): string {
+  if (value.length <= 2) {
+    return '*'.repeat(value.length);
+  }
+  const visiblePrefix = value[0];
+  const visibleSuffix = value[value.length - 1];
+  return `${visiblePrefix}${'*'.repeat(Math.max(value.length - 2, 1))}${visibleSuffix}`;
+}
+
+function maskValue(key: string, value: any): any {
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => maskValue(key, item));
+  }
+
+  if (typeof value === 'object') {
+    return maskRecord(value as Record<string, any>);
+  }
+
+  if (typeof value === 'string' && PII_FIELDS.includes(key)) {
+    return maskString(value);
+  }
+
+  return value;
+}
+
+function maskRecord(record: any): any {
+  if (record === null || record === undefined) {
+    return record;
+  }
+  if (Array.isArray(record)) {
+    return record.map((item) => maskRecord(item));
+  }
+  if (typeof record !== 'object') {
+    return record;
+  }
+  return Object.fromEntries(
+    Object.entries(record as Record<string, any>).map(([key, value]) => [key, maskValue(key, value)])
+  );
+}
+
+function maskRecords(records: any[]): any[] {
+  return records.map((record) => maskRecord(record));
+}
+
+function normalizeIds(ids: number | number[]): number[] {
+  const arrayIds = Array.isArray(ids) ? ids : [ids];
+  if (arrayIds.length === 0) {
+    throw new Error('At least one ID must be provided.');
+  }
+  const processed = arrayIds.map((id) => {
+    if (typeof id !== 'number' || !Number.isInteger(id) || id <= 0) {
+      throw new Error('Record IDs must be positive integers.');
+    }
+    return id;
+  });
+  return Array.from(new Set(processed));
+}
+
+function summarizeAction(action: string, payload: Record<string, any>): Record<string, any> {
+  return {
+    action,
+    payload,
+    note: 'This is a dry-run/plan response. Execute with mode="confirm" to apply changes.',
+  };
+}
+
+async function checkDryRunAccess(model: string, operation: 'create' | 'write' | 'unlink'): Promise<boolean> {
+  try {
+    return await odooConnector.checkAccessRights(model, operation);
+  } catch (error) {
+    return false;
+  }
+}
+
+function assertExecutionMode(mode: string): asserts mode is ExecutionMode {
+  if (!EXECUTION_MODES.includes(mode as ExecutionMode)) {
+    throw new Error(`Execution mode must be one of: ${EXECUTION_MODES.join(', ')}`);
+  }
+}
+
+export const versionTool: Tool = {
+  name: 'odoo.version',
+  description: 'Returns the version information reported by the connected Odoo server.',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+  },
+  execute: async () => {
+    try {
+      const version = await odooConnector.getVersion();
+      return version;
+    } catch (error: any) {
+      return { error: `Failed to retrieve version: ${error.message}` };
+    }
+  },
+};
+
+export const modelsTool: Tool = {
+  name: 'odoo.models',
+  description: 'Lists the models and fields that are available through this connector.',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+  },
+  execute: async () => {
+    try {
+      return SAFE_MODELS.map((model) => ({
+        model,
+        writable: WRITABLE_MODELS.includes(model),
+        fields: ALLOWED_MODELS[model].fields,
+        allowed_methods: BUSINESS_METHOD_WHITELIST[model] ?? [],
+      }));
+    } catch (error: any) {
+      return { error: `Failed to load model metadata: ${error.message}` };
+    }
+  },
+};
+
 export const searchReadTool: Tool = {
   name: 'odoo.search_read',
   description: 'Searches for and reads records of a given model in Odoo.',
-  inputSchema: z.object({
-    model: z.enum(ALLOWED_MODELS as [string, ...string[]]).describe('The technical name of the Odoo model to search (e.g., "res.partner").'),
-    domain: z.array(z.any()).optional().describe('The search domain to filter records (e.g., [["is_company", "=", true]]). Defaults to an empty domain.'),
-    fields: z.array(z.string()).optional().describe('The fields to return for each record (e.g., ["name", "email"]). Defaults to a few common fields.'),
-    limit: z.number().int().positive().max(100).optional().describe('The maximum number of records to return. Defaults to 5, max 100.'),
-    order: z.string().optional().describe('The field to sort the results by (e.g., "name ASC").'),
-  }),
-  execute: async ({ model, domain = [], fields = ['id', 'name', 'display_name'], limit = 5, order }) => {
+  inputSchema: {
+    type: 'object',
+    required: ['model'],
+    properties: {
+      model: {
+        type: 'string',
+        enum: SAFE_MODELS,
+        description: 'The technical name of the Odoo model to search.',
+      },
+      domain: {
+        type: 'array',
+        description: 'The Odoo search domain to filter records.',
+      },
+      fields: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'The fields to return for each record.',
+      },
+      limit: {
+        type: 'integer',
+        minimum: 1,
+        maximum: MAX_LIMIT,
+        description: 'Maximum number of records to return.',
+      },
+      order: {
+        type: 'string',
+        description: 'Order clause (e.g., "name ASC"). Only whitelisted fields are accepted.',
+      },
+    },
+  },
+  execute: async ({ model, domain = [], fields, limit = DEFAULT_LIMIT, order }: SearchReadInput) => {
     try {
-      const records = await odooConnector.searchRead(
-        model,
-        domain,
-        fields,
-        limit,
-        0, // offset
-        order
+      assertModelAllowed(model);
+      if (!Array.isArray(domain)) {
+        throw new Error('Domain must be an array.');
+      }
+      const safeFields = ensureFieldsAllowed(model, fields);
+      const safeLimit = Math.min(
+        Math.max(typeof limit === 'number' && Number.isFinite(limit) ? Math.floor(limit) : DEFAULT_LIMIT, 1),
+        MAX_LIMIT
       );
+      const safeOrder = sanitizeOrder(model, order);
+      const records = await odooConnector.searchRead<any>(model, domain, safeFields, safeLimit, 0, safeOrder ?? '');
       return {
         count: records.length,
-        records: records,
+        records: maskRecords(records),
       };
     } catch (error: any) {
       return { error: `Failed to execute search_read: ${error.message}` };
@@ -47,38 +307,337 @@ export const searchReadTool: Tool = {
   },
 };
 
-/**
- * Tool to get information about the currently authenticated user.
- */
-export const meTool: Tool = {
-    name: 'odoo.me',
-    description: 'Gets information about the currently authenticated user.',
-    inputSchema: z.object({}),
-    execute: async () => {
-        const uid = odooConnector.getUid();
-        if (!uid) {
-            return { error: 'Not connected. Cannot get user information.' };
-        }
-        try {
-            const users = await odooConnector.execute<any[]>(
-                'res.users',
-                'read',
-                [[uid]],
-                { fields: ['id', 'name', 'login', 'company_id', 'partner_id'] }
-            );
-
-            if (users.length === 0) {
-                return { error: `User with UID ${uid} not found.` };
-            }
-            return users[0];
-        } catch (error: any) {
-            return { error: `Failed to get user info: ${error.message}` };
-        }
+export const getTool: Tool = {
+  name: 'odoo.get',
+  description: 'Retrieves a single record by ID.',
+  inputSchema: {
+    type: 'object',
+    required: ['model', 'id'],
+    properties: {
+      model: {
+        type: 'string',
+        enum: SAFE_MODELS,
+        description: 'The model to read.',
+      },
+      id: {
+        type: 'integer',
+        minimum: 1,
+        description: 'The record ID to read.',
+      },
+      fields: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'The fields to return. Defaults to the model whitelist.',
+      },
+    },
+  },
+  execute: async ({ model, id, fields }: GetInput) => {
+    try {
+      assertModelAllowed(model);
+      if (typeof id !== 'number' || !Number.isInteger(id) || id <= 0) {
+        throw new Error('Record ID must be a positive integer.');
+      }
+      const safeFields = ensureFieldsAllowed(model, fields);
+      const [record] = await odooConnector.read<any>(model, [id], safeFields);
+      if (!record) {
+        return { error: `Record ${id} not found for model ${model}.` };
+      }
+      return maskRecord(record);
+    } catch (error: any) {
+      return { error: `Failed to execute get: ${error.message}` };
     }
+  },
 };
 
-// We will add more tools here as we implement them.
+export const countTool: Tool = {
+  name: 'odoo.count',
+  description: 'Counts records matching a domain.',
+  inputSchema: {
+    type: 'object',
+    required: ['model'],
+    properties: {
+      model: {
+        type: 'string',
+        enum: SAFE_MODELS,
+        description: 'The model to count records for.',
+      },
+      domain: {
+        type: 'array',
+        description: 'The Odoo domain to match.',
+      },
+    },
+  },
+  execute: async ({ model, domain = [] }: CountInput) => {
+    try {
+      assertModelAllowed(model);
+      if (!Array.isArray(domain)) {
+        throw new Error('Domain must be an array.');
+      }
+      const total = await odooConnector.count(model, domain);
+      return { count: total };
+    } catch (error: any) {
+      return { error: `Failed to execute count: ${error.message}` };
+    }
+  },
+};
+
+export const createTool: Tool = {
+  name: 'odoo.create',
+  description: 'Creates a new record. Requires plan → dry_run → confirm flow.',
+  inputSchema: {
+    type: 'object',
+    required: ['model', 'values', 'mode'],
+    properties: {
+      model: {
+        type: 'string',
+        enum: WRITABLE_MODELS,
+        description: 'The model to create a record for.',
+      },
+      values: {
+        type: 'object',
+        description: 'Field values for the new record.',
+      },
+      mode: executionModeSchema,
+    },
+  },
+  execute: async ({ model, values, mode }: CreateInput) => {
+    try {
+      assertModelAllowed(model);
+      assertModelWritable(model);
+      assertExecutionMode(mode);
+      const sanitizedValues = sanitizeValues(model, values);
+
+      if (mode === 'plan') {
+        return summarizeAction('plan:create', { model, values: sanitizedValues });
+      }
+
+      if (mode === 'dry_run') {
+        const allowed = await checkDryRunAccess(model, 'create');
+        return summarizeAction('dry_run:create', {
+          model,
+          allowed,
+          values: maskRecord(sanitizedValues),
+        });
+      }
+
+      const id = await odooConnector.create(model, sanitizedValues);
+      return { id };
+    } catch (error: any) {
+      return { error: `Failed to execute create: ${error.message}` };
+    }
+  },
+};
+
+export const writeTool: Tool = {
+  name: 'odoo.write',
+  description: 'Updates one or more records. Requires plan → dry_run → confirm flow.',
+  inputSchema: {
+    type: 'object',
+    required: ['model', 'ids', 'values', 'mode'],
+    properties: {
+      model: {
+        type: 'string',
+        enum: WRITABLE_MODELS,
+        description: 'The model containing the records.',
+      },
+      ids: {
+        anyOf: [
+          { type: 'integer', minimum: 1 },
+          { type: 'array', items: { type: 'integer', minimum: 1 }, minItems: 1 },
+        ],
+        description: 'One or more record IDs to update.',
+      },
+      values: {
+        type: 'object',
+        description: 'Field values to update.',
+      },
+      mode: executionModeSchema,
+    },
+  },
+  execute: async ({ model, ids, values, mode }: WriteInput) => {
+    try {
+      assertModelAllowed(model);
+      assertModelWritable(model);
+      assertExecutionMode(mode);
+      const sanitizedValues = sanitizeValues(model, values);
+      const targetIds = normalizeIds(ids);
+
+      if (mode === 'plan') {
+        return summarizeAction('plan:write', { model, ids: targetIds, values: sanitizedValues });
+      }
+
+      if (mode === 'dry_run') {
+        const allowed = await checkDryRunAccess(model, 'write');
+        return summarizeAction('dry_run:write', {
+          model,
+          ids: targetIds,
+          allowed,
+          values: maskRecord(sanitizedValues),
+        });
+      }
+
+      const success = await odooConnector.write(model, targetIds, sanitizedValues);
+      return { success };
+    } catch (error: any) {
+      return { error: `Failed to execute write: ${error.message}` };
+    }
+  },
+};
+
+export const unlinkTool: Tool = {
+  name: 'odoo.unlink',
+  description: 'Deletes one or more records. Requires plan → dry_run → confirm flow.',
+  inputSchema: {
+    type: 'object',
+    required: ['model', 'ids', 'mode'],
+    properties: {
+      model: {
+        type: 'string',
+        enum: WRITABLE_MODELS,
+        description: 'The model containing the records.',
+      },
+      ids: {
+        anyOf: [
+          { type: 'integer', minimum: 1 },
+          { type: 'array', items: { type: 'integer', minimum: 1 }, minItems: 1 },
+        ],
+        description: 'One or more record IDs to delete.',
+      },
+      mode: executionModeSchema,
+    },
+  },
+  execute: async ({ model, ids, mode }: UnlinkInput) => {
+    try {
+      assertModelAllowed(model);
+      assertModelWritable(model);
+      assertExecutionMode(mode);
+      const targetIds = normalizeIds(ids);
+
+      if (mode === 'plan') {
+        return summarizeAction('plan:unlink', { model, ids: targetIds });
+      }
+
+      if (mode === 'dry_run') {
+        const allowed = await checkDryRunAccess(model, 'unlink');
+        return summarizeAction('dry_run:unlink', {
+          model,
+          ids: targetIds,
+          allowed,
+        });
+      }
+
+      const success = await odooConnector.unlink(model, targetIds);
+      return { success };
+    } catch (error: any) {
+      return { error: `Failed to execute unlink: ${error.message}` };
+    }
+  },
+};
+
+export const callKwTool: Tool = {
+  name: 'odoo.call_kw',
+  description: 'Calls a whitelisted business method on a model. Requires plan → dry_run → confirm flow.',
+  inputSchema: {
+    type: 'object',
+    required: ['model', 'method', 'mode'],
+    properties: {
+      model: {
+        type: 'string',
+        enum: SAFE_MODELS,
+        description: 'The model whose method to call.',
+      },
+      method: {
+        type: 'string',
+        description: 'The method name to invoke (must be whitelisted).',
+      },
+      args: {
+        type: 'array',
+        description: 'Positional arguments for the method.',
+      },
+      kwargs: {
+        type: 'object',
+        description: 'Keyword arguments for the method.',
+      },
+      mode: executionModeSchema,
+    },
+  },
+  execute: async ({ model, method, args = [], kwargs = {}, mode }: CallKwInput) => {
+    try {
+      assertModelAllowed(model);
+      const allowedMethods = BUSINESS_METHOD_WHITELIST[model] ?? [];
+      if (!allowedMethods.includes(method)) {
+        throw new Error(`Method ${method} is not whitelisted for model ${model}.`);
+      }
+      assertExecutionMode(mode);
+      if (!Array.isArray(args)) {
+        throw new Error('Args must be provided as an array.');
+      }
+      if (kwargs === null || typeof kwargs !== 'object' || Array.isArray(kwargs)) {
+        throw new Error('Kwargs must be provided as an object.');
+      }
+
+      if (mode === 'plan') {
+        return summarizeAction('plan:call_kw', { model, method, args, kwargs });
+      }
+
+      if (mode === 'dry_run') {
+        const allowed = await checkDryRunAccess(model, 'write');
+        return summarizeAction('dry_run:call_kw', { model, method, allowed });
+      }
+
+      const result = await odooConnector.callKw<any>(model, method, args, kwargs);
+      if (Array.isArray(result)) {
+        return maskRecords(result as Record<string, any>[]);
+      }
+      if (typeof result === 'object' && result !== null) {
+        return maskRecord(result as Record<string, any>);
+      }
+      return result;
+    } catch (error: any) {
+      return { error: `Failed to execute call_kw: ${error.message}` };
+    }
+  },
+};
+
+export const meTool: Tool = {
+  name: 'odoo.me',
+  description: 'Gets information about the currently authenticated user.',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+  },
+  execute: async () => {
+    const uid = odooConnector.getUid();
+    if (!uid) {
+      return { error: 'Not connected. Cannot get user information.' };
+    }
+    try {
+      const users = await odooConnector.execute<any[]>(
+        'res.users',
+        'read',
+        [[uid]],
+        { fields: ['id', 'name', 'login', 'company_id', 'partner_id'] }
+      );
+
+      if (users.length === 0) {
+        return { error: `User with UID ${uid} not found.` };
+      }
+      return maskRecord(users[0]);
+    } catch (error: any) {
+      return { error: `Failed to get user info: ${error.message}` };
+    }
+  },
+};
+
 export const odooTools = [
-    searchReadTool,
-    meTool,
+  versionTool,
+  modelsTool,
+  searchReadTool,
+  getTool,
+  countTool,
+  createTool,
+  writeTool,
+  unlinkTool,
+  callKwTool,
+  meTool,
 ];
