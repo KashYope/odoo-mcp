@@ -3,7 +3,7 @@ import { loadEnv } from './env-loader';
 
 loadEnv();
 
-interface OdooConnectionConfig {
+export interface OdooConnectionConfig {
   baseUrl: string;
   db: string;
   username: string;
@@ -35,7 +35,7 @@ export interface OdooTransport {
   getUid(): number | null;
 }
 
-class JsonRpcTransport implements OdooTransport {
+export class JsonRpcTransport implements OdooTransport {
   private readonly config: OdooConnectionConfig;
   private readonly baseUrl: string;
   private readonly timeout = 15000;
@@ -126,7 +126,7 @@ class JsonRpcTransport implements OdooTransport {
   }
 }
 
-function loadConfigFromEnv(): OdooConnectionConfig {
+export function loadConfigFromEnv(): OdooConnectionConfig {
   const baseUrl = process.env.ODOO_URL;
   const db = process.env.ODOO_DB;
   const username = process.env.ODOO_USERNAME;
@@ -139,7 +139,7 @@ function loadConfigFromEnv(): OdooConnectionConfig {
   return { baseUrl, db, username, apiKey };
 }
 
-class OdooConnector {
+export class OdooConnector {
   private readonly transport: OdooTransport;
   private uid: number | null = null;
 

@@ -269,6 +269,26 @@ function assertExecutionMode(mode: string): asserts mode is ExecutionMode {
   }
 }
 
+export const __testables = {
+  assertModelAllowed,
+  assertModelWritable,
+  ensureFieldsAllowed,
+  sanitizeOrder,
+  sanitizeValues,
+  maskString,
+  maskValue,
+  maskRecord,
+  maskRecords,
+  normalizeIds,
+  summarizeAction,
+  resolveActor,
+  formatIso,
+  buildPlanMetadata,
+  buildDryRunMetadata,
+  buildConfirmMetadata,
+  assertExecutionMode,
+};
+
 export const versionTool: Tool = {
   name: 'odoo.version',
   description: 'Returns the version information reported by the connected Odoo server.',

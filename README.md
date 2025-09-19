@@ -75,6 +75,19 @@ The HTTP server also exposes a `GET /health` endpoint that can be used for readi
 are streamed back to the client through `tools/stream` notifications followed by a terminal JSON-RPC response when the
 execution completes.
 
+### Running Tests
+
+This project relies on Node's built-in test runner together with `ts-node` for TypeScript support. To execute the full unit test
+suite, run:
+
+```bash
+npm test
+```
+
+The command discovers all `*.test.ts` files under the `tests/` directory and executes them. Include `npm test` as part of your
+CI pipeline to ensure the Odoo connector, masking logic, and confirmation workflows remain covered by automated regression
+tests.
+
 ## 🧰 Implemented Tools
 
 The following MCP tools are available:
