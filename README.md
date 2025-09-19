@@ -19,6 +19,7 @@ The data flows from the LLM agent to Odoo and back through the MCP stack:
 - **Controlled Actions**: The connector exposes a set of well-defined tools (e.g., `odoo.search_read`, `odoo.create`) rather than the full, unrestricted API.
 - **LLM-Friendly Interface**: The MCP tools are designed with schemas that make them easy for an LLM to understand and use. PII (Personally Identifiable Information) is masked in responses sent back to the agent.
 - **Auditability**: All requests and responses are logged for security and debugging purposes.
+- **Self-contained MCP runtime**: A lightweight host and event store are bundled so the connector can run without external SDK dependencies.
 
 ## 🚀 Getting Started
 
@@ -42,7 +43,7 @@ The data flows from the LLM agent to Odoo and back through the MCP stack:
 
 ### Configuration
 
-1.  Create a `.env` file in the root of the project.
+1.  Create a `.env` file in the root of the project. The connector automatically loads it on startup.
 2.  Add your Odoo connection details to the `.env` file:
 
     ```env

@@ -1,76 +1,198 @@
-import Odoo from 'odoo-xmlrpc';
-import * as dotenv from 'dotenv';
+import crypto from 'crypto';
+import { loadEnv } from './env-loader';
 
-// Load environment variables from .env file
-dotenv.config();
+loadEnv();
 
-class OdooConnector {
-  private odoo: Odoo;
+interface OdooConnectionConfig {
+  baseUrl: string;
+  db: string;
+  username: string;
+  apiKey: string;
+}
+
+interface JsonRpcParams {
+  service: 'common' | 'object';
+  method: string;
+  args: any[];
+  kwargs?: Record<string, any>;
+}
+
+interface JsonRpcResponse<T> {
+  jsonrpc: string;
+  id: string;
+  result?: T;
+  error?: {
+    code: number;
+    message: string;
+    data?: any;
+  };
+}
+
+export interface OdooTransport {
+  connect(): Promise<number>;
+  executeKw<T>(model: string, method: string, params?: any[], kwargs?: Record<string, any>): Promise<T>;
+  callCommon<T>(method: string, args?: any[]): Promise<T>;
+  getUid(): number | null;
+}
+
+class JsonRpcTransport implements OdooTransport {
+  private readonly config: OdooConnectionConfig;
+  private readonly baseUrl: string;
+  private readonly timeout = 15000;
   private uid: number | null = null;
 
-  constructor() {
-    this.odoo = new Odoo({
-      url: process.env.ODOO_URL,
-      port: process.env.ODOO_PORT ? parseInt(process.env.ODOO_PORT, 10) : 80,
-      db: process.env.ODOO_DB,
-      username: process.env.ODOO_USERNAME,
-      password: process.env.ODOO_API_KEY, // Use API key as password
-    });
+  constructor(config: OdooConnectionConfig) {
+    this.config = config;
+    this.baseUrl = config.baseUrl.replace(/\/$/, '');
   }
 
-  /**
-   * Connects to the Odoo server and authenticates the user.
-   * The user ID (uid) is stored for subsequent calls.
-   */
-  public connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.odoo.connect((err: any, uid: any) => {
-        if (err) {
-          console.error('Failed to connect to Odoo:', err);
-          return reject(err);
-        }
-        // The connect method in this library actually returns the UID directly.
-        // We will store it for later use.
-        this.uid = uid;
-        console.log(`Successfully connected to Odoo. UID: ${this.uid}`);
-        resolve();
+  private async request<T>(params: JsonRpcParams): Promise<T> {
+    const payload = {
+      jsonrpc: '2.0',
+      method: 'call',
+      params,
+      id: crypto.randomUUID(),
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeout);
+
+    try {
+      const response = await fetch(`${this.baseUrl}/jsonrpc`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
       });
-    });
-  }
 
-  /**
-   * Executes a method on an Odoo model.
-   * This is a wrapper around the 'execute_kw' method of the Odoo API.
-   * @param model The Odoo model to call the method on (e.g., 'res.partner').
-   * @param method The method to call (e.g., 'search_read').
-   * @param params An array of parameters for the method.
-   * @returns A promise that resolves with the result of the method call.
-   */
-  public execute<T>(model: string, method: string, params: any[] = [[]], kwargs: object = {}): Promise<T> {
-    return new Promise((resolve, reject) => {
-      if (this.uid === null) {
-        return reject(new Error('Not connected to Odoo. Please call connect() first.'));
+      if (!response.ok) {
+        throw new Error(`Odoo request failed with status ${response.status}`);
       }
 
-      // The odoo-xmlrpc library has a quirky way of passing parameters.
-      // It expects a single array where the first element is the positional args array,
-      // and the second is the keyword args object.
-      const formattedParams = [params, kwargs];
+      const data = (await response.json()) as JsonRpcResponse<T>;
+      if (data.error) {
+        throw new Error(`${data.error.message}: ${JSON.stringify(data.error.data)}`);
+      }
+      if (data.result === undefined) {
+        throw new Error('No result returned from Odoo.');
+      }
+      return data.result;
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error('The request to Odoo timed out.');
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 
-      this.odoo.execute_kw(model, method, formattedParams, (err: any, value: any) => {
-        if (err) {
-          console.error(`Error executing Odoo method: ${model}.${method}`, err);
-          return reject(err);
-        }
-        resolve(value as T);
-      });
+  async connect(): Promise<number> {
+    const uid = await this.request<number>({
+      service: 'common',
+      method: 'authenticate',
+      args: [this.config.db, this.config.username, this.config.apiKey, {}],
+    });
+
+    if (typeof uid !== 'number') {
+      throw new Error('Authentication failed. Ensure your credentials and API access are correct.');
+    }
+
+    this.uid = uid;
+    return uid;
+  }
+
+  async executeKw<T>(model: string, method: string, params: any[] = [], kwargs: Record<string, any> = {}): Promise<T> {
+    if (this.uid === null) {
+      throw new Error('Not authenticated with Odoo. Call connect() first.');
+    }
+
+    const args = [this.config.db, this.uid, this.config.apiKey, model, method, params, kwargs];
+    return this.request<T>({ service: 'object', method: 'execute_kw', args });
+  }
+
+  async callCommon<T>(method: string, args: any[] = []): Promise<T> {
+    return this.request<T>({
+      service: 'common',
+      method,
+      args,
     });
   }
 
-  /**
-   * A specific wrapper for the 'search_read' method.
-   */
-  public searchRead<T>(
+  getUid(): number | null {
+    return this.uid;
+  }
+}
+
+function loadConfigFromEnv(): OdooConnectionConfig {
+  const baseUrl = process.env.ODOO_URL;
+  const db = process.env.ODOO_DB;
+  const username = process.env.ODOO_USERNAME;
+  const apiKey = process.env.ODOO_API_KEY;
+
+  if (!baseUrl || !db || !username || !apiKey) {
+    throw new Error('Missing required Odoo configuration. Please set ODOO_URL, ODOO_DB, ODOO_USERNAME, and ODOO_API_KEY in your environment.');
+  }
+
+  return { baseUrl, db, username, apiKey };
+}
+
+class OdooConnector {
+  private readonly transport: OdooTransport;
+  private uid: number | null = null;
+
+  constructor(transport?: OdooTransport) {
+    this.transport = transport ?? new JsonRpcTransport(loadConfigFromEnv());
+  }
+
+  public async connect(): Promise<void> {
+    const uid = await this.transport.connect();
+    this.uid = uid;
+    console.log(`Successfully connected to Odoo. UID: ${uid}`);
+  }
+
+  public getUid(): number | null {
+    return this.uid;
+  }
+
+  private ensureConnected(): void {
+    if (this.uid === null) {
+      throw new Error('Not connected to Odoo. Please call connect() first.');
+    }
+  }
+
+  private logRequest(model: string, method: string, params: any[], kwargs: Record<string, any>): string {
+    const payloadHash = crypto.createHash('sha256').update(JSON.stringify({ model, method, params, kwargs })).digest('hex');
+    const requestId = payloadHash.slice(0, 12);
+    console.log(`[Odoo] -> ${model}.${method} (request ${requestId})`);
+    return requestId;
+  }
+
+  private logResponse(model: string, method: string, requestId: string, error?: Error): void {
+    if (error) {
+      console.error(`[Odoo] !! ${model}.${method} (request ${requestId})`, error.message);
+    } else {
+      console.log(`[Odoo] <- ${model}.${method} (request ${requestId})`);
+    }
+  }
+
+  public async execute<T>(model: string, method: string, params: any[] = [], kwargs: Record<string, any> = {}): Promise<T> {
+    this.ensureConnected();
+    const requestId = this.logRequest(model, method, params, kwargs);
+    try {
+      const result = await this.transport.executeKw<T>(model, method, params, kwargs);
+      this.logResponse(model, method, requestId);
+      return result;
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.logResponse(model, method, requestId, err);
+      throw err;
+    }
+  }
+
+  public async searchRead<T>(
     model: string,
     domain: any[] = [],
     fields: string[] = [],
@@ -78,17 +200,47 @@ class OdooConnector {
     offset: number = 0,
     order: string = ''
   ): Promise<T[]> {
-    const kwargs = {
-        fields,
-        limit,
-        offset,
-        order,
+    const kwargs: Record<string, any> = {
+      fields,
+      limit,
+      offset,
     };
-    return this.execute(model, 'search_read', [domain], kwargs);
+    if (order) {
+      kwargs.order = order;
+    }
+    return this.execute<T[]>(model, 'search_read', [domain], kwargs);
   }
 
-  public getUid(): number | null {
-    return this.uid;
+  public async read<T>(model: string, ids: number[], fields: string[]): Promise<T[]> {
+    return this.execute<T[]>(model, 'read', [ids], { fields });
+  }
+
+  public async count(model: string, domain: any[]): Promise<number> {
+    return this.execute<number>(model, 'search_count', [domain]);
+  }
+
+  public async create(model: string, values: Record<string, any>): Promise<number> {
+    return this.execute<number>(model, 'create', [values]);
+  }
+
+  public async write(model: string, ids: number[], values: Record<string, any>): Promise<boolean> {
+    return this.execute<boolean>(model, 'write', [ids, values]);
+  }
+
+  public async unlink(model: string, ids: number[]): Promise<boolean> {
+    return this.execute<boolean>(model, 'unlink', [ids]);
+  }
+
+  public async callKw<T>(model: string, method: string, args: any[] = [], kwargs: Record<string, any> = {}): Promise<T> {
+    return this.execute<T>(model, method, args, kwargs);
+  }
+
+  public async checkAccessRights(model: string, operation: 'create' | 'write' | 'unlink'): Promise<boolean> {
+    return this.execute<boolean>(model, 'check_access_rights', [operation], { raise_exception: false });
+  }
+
+  public async getVersion(): Promise<Record<string, any>> {
+    return this.transport.callCommon<Record<string, any>>('version');
   }
 }
 
