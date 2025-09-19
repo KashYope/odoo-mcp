@@ -2,11 +2,284 @@ import crypto from 'crypto';
 import http, { IncomingMessage, ServerResponse } from 'http';
 import net from 'net';
 
+export interface ToolExecutionContext {
+  sessionId: string;
+  eventStore: InMemoryEventStore;
+  actionStore: ActionStateStore;
+  clientInfo?: any;
+}
+
 export interface Tool {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  execute: (input: any) => Promise<any> | AsyncIterable<any> | Iterable<any> | any;
+  execute: (input: any, context: ToolExecutionContext) => Promise<any> | AsyncIterable<any> | Iterable<any> | any;
+}
+
+type ActionStage = 'plan' | 'dry_run' | 'confirm';
+
+export interface ActionStageRecord<TMode extends ActionStage> {
+  actionId: string;
+  mode: TMode;
+  sessionId: string;
+  tool: string;
+  payload: Record<string, any>;
+  result: any;
+  timestamp: number;
+  metadata: {
+    requestedBy?: string;
+    approvedBy?: string;
+    approvedAt?: number;
+    confirmedBy?: string;
+    confirmedAt?: number;
+    expiresAt?: number;
+  };
+}
+
+interface ActionLifecycle {
+  actionId: string;
+  sessionId: string;
+  tool: string;
+  payload: Record<string, any>;
+  signature: string;
+  plan?: ActionStageRecord<'plan'>;
+  dryRun?: ActionStageRecord<'dry_run'>;
+  confirm?: ActionStageRecord<'confirm'>;
+}
+
+const DEFAULT_APPROVAL_TTL_MS = 5 * 60 * 1000;
+
+export class ActionStateStore {
+  private readonly lifecycles = new Map<string, ActionLifecycle>();
+  private readonly signatureIndex = new Map<string, string>();
+
+  constructor(private readonly eventStore: InMemoryEventStore) {}
+
+  recordPlan(params: {
+    sessionId: string;
+    tool: string;
+    payload: Record<string, any>;
+    result: any;
+    requestedBy?: string;
+  }): ActionStageRecord<'plan'> {
+    const { sessionId, tool, payload, result, requestedBy } = params;
+    const actionId = crypto.randomUUID();
+    const signature = this.computeSignature(sessionId, tool, payload);
+    const timestamp = Date.now();
+
+    const lifecycle: ActionLifecycle = {
+      actionId,
+      sessionId,
+      tool,
+      payload,
+      signature,
+    };
+
+    const plan: ActionStageRecord<'plan'> = {
+      actionId,
+      mode: 'plan',
+      sessionId,
+      tool,
+      payload,
+      result,
+      timestamp,
+      metadata: {
+        requestedBy,
+      },
+    };
+
+    lifecycle.plan = plan;
+
+    const existing = this.signatureIndex.get(signature);
+    if (existing) {
+      this.lifecycles.delete(existing);
+    }
+
+    this.lifecycles.set(actionId, lifecycle);
+    this.signatureIndex.set(signature, actionId);
+    this.eventStore.append({
+      type: 'action_plan_recorded',
+      actionId,
+      sessionId,
+      tool,
+      payload,
+      result,
+      metadata: plan.metadata,
+      timestamp,
+    });
+
+    return plan;
+  }
+
+  recordDryRun(params: {
+    sessionId: string;
+    tool: string;
+    payload: Record<string, any>;
+    result: any;
+    approvedBy?: string;
+    approvalTtlMs?: number;
+  }): ActionStageRecord<'dry_run'> {
+    const { sessionId, tool, payload, result, approvedBy, approvalTtlMs } = params;
+    const signature = this.computeSignature(sessionId, tool, payload);
+    const actionId = this.signatureIndex.get(signature);
+    if (!actionId) {
+      throw new Error('A prior plan run is required before dry_run.');
+    }
+
+    const lifecycle = this.lifecycles.get(actionId);
+    if (!lifecycle || !lifecycle.plan) {
+      throw new Error('Plan metadata missing for this action.');
+    }
+
+    if (lifecycle.sessionId !== sessionId) {
+      throw new Error('Action session mismatch.');
+    }
+
+    const timestamp = Date.now();
+    const expiresAt = timestamp + (approvalTtlMs ?? DEFAULT_APPROVAL_TTL_MS);
+
+    const dryRun: ActionStageRecord<'dry_run'> = {
+      actionId,
+      mode: 'dry_run',
+      sessionId,
+      tool,
+      payload,
+      result,
+      timestamp,
+      metadata: {
+        requestedBy: lifecycle.plan.metadata.requestedBy,
+        approvedBy,
+        approvedAt: timestamp,
+        expiresAt,
+      },
+    };
+
+    lifecycle.dryRun = dryRun;
+    lifecycle.payload = payload;
+    this.eventStore.append({
+      type: 'action_dry_run_recorded',
+      actionId,
+      sessionId,
+      tool,
+      payload,
+      result,
+      metadata: dryRun.metadata,
+      timestamp,
+    });
+
+    return dryRun;
+  }
+
+  validateConfirm(params: {
+    actionId: string;
+    sessionId: string;
+    tool: string;
+    payload: Record<string, any>;
+  }): ActionStageRecord<'dry_run'> {
+    const { actionId, sessionId, tool, payload } = params;
+    const lifecycle = this.lifecycles.get(actionId);
+    if (!lifecycle) {
+      throw new Error('Unknown action. Please re-run plan and dry_run.');
+    }
+
+    if (lifecycle.tool !== tool) {
+      throw new Error('Action tool mismatch.');
+    }
+
+    if (lifecycle.sessionId !== sessionId) {
+      throw new Error('Action session mismatch.');
+    }
+
+    const expectedSignature = this.computeSignature(sessionId, tool, payload);
+    if (expectedSignature !== lifecycle.signature) {
+      throw new Error('Confirmation payload differs from the approved dry_run.');
+    }
+
+    const dryRun = lifecycle.dryRun;
+    if (!dryRun) {
+      throw new Error('A matching dry_run approval is required before confirmation.');
+    }
+
+    if (!dryRun.metadata.approvedBy) {
+      throw new Error('Dry_run has not been approved.');
+    }
+
+    if (dryRun.metadata.expiresAt && dryRun.metadata.expiresAt < Date.now()) {
+      throw new Error('Dry_run approval has expired. Please run a new dry_run.');
+    }
+
+    if (lifecycle.confirm) {
+      throw new Error('Action already confirmed.');
+    }
+
+    return dryRun;
+  }
+
+  recordConfirm(params: {
+    actionId: string;
+    sessionId: string;
+    tool: string;
+    payload: Record<string, any>;
+    result: any;
+    confirmedBy?: string;
+  }): ActionStageRecord<'confirm'> {
+    const { actionId, sessionId, tool, payload, result, confirmedBy } = params;
+    const lifecycle = this.lifecycles.get(actionId);
+    if (!lifecycle) {
+      throw new Error('Unknown action.');
+    }
+
+    const timestamp = Date.now();
+    const confirm: ActionStageRecord<'confirm'> = {
+      actionId,
+      mode: 'confirm',
+      sessionId,
+      tool,
+      payload,
+      result,
+      timestamp,
+      metadata: {
+        requestedBy: lifecycle.plan?.metadata.requestedBy,
+        approvedBy: lifecycle.dryRun?.metadata.approvedBy,
+        approvedAt: lifecycle.dryRun?.metadata.approvedAt,
+        expiresAt: lifecycle.dryRun?.metadata.expiresAt,
+        confirmedBy,
+        confirmedAt: timestamp,
+      },
+    };
+
+    lifecycle.confirm = confirm;
+    this.signatureIndex.delete(lifecycle.signature);
+    this.eventStore.append({
+      type: 'action_confirm_recorded',
+      actionId,
+      sessionId,
+      tool,
+      payload,
+      result,
+      metadata: confirm.metadata,
+      timestamp,
+    });
+
+    return confirm;
+  }
+
+  private computeSignature(sessionId: string, tool: string, payload: Record<string, any>): string {
+    const serialized = this.stableStringify(payload);
+    return `${sessionId}:${tool}:${serialized}`;
+  }
+
+  private stableStringify(value: any): string {
+    if (value === null || typeof value !== 'object') {
+      return JSON.stringify(value);
+    }
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => this.stableStringify(item)).join(',')}]`;
+    }
+    const keys = Object.keys(value).sort();
+    const entries = keys.map((key) => `${JSON.stringify(key)}:${this.stableStringify((value as Record<string, any>)[key])}`);
+    return `{${entries.join(',')}}`;
+  }
 }
 
 export class ToolRegistry {
@@ -78,10 +351,12 @@ interface Session {
 export class Host {
   public readonly tools: ToolRegistry;
   private readonly eventStore: InMemoryEventStore;
+  private readonly actionStore: ActionStateStore;
   private readonly sessions = new Set<Session>();
 
   constructor(options: HostOptions) {
     this.eventStore = options.eventStore;
+    this.actionStore = new ActionStateStore(this.eventStore);
     this.tools = new ToolRegistry();
   }
 
@@ -337,7 +612,12 @@ export class Host {
 
     (async () => {
       try {
-        const result = await tool.execute(args);
+        const result = await tool.execute(args, {
+          sessionId: session.id,
+          eventStore: this.eventStore,
+          actionStore: this.actionStore,
+          clientInfo: session.clientInfo,
+        });
         if (isAsyncIterable(result) || isStreamableIterable(result)) {
           for await (const chunk of toAsyncIterable(result)) {
             this.sendNotification(session, 'tools/stream', {

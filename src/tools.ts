@@ -1,4 +1,4 @@
-import { Tool } from './mcp';
+import { ActionStageRecord, Tool, ToolExecutionContext } from './mcp';
 import { odooConnector } from './odoo-connector';
 import {
   ALLOWED_MODELS,
@@ -42,6 +42,7 @@ type CreateInput = {
   model: string;
   values: Record<string, any>;
   mode: ExecutionMode;
+  action_id?: string;
 };
 
 type WriteInput = {
@@ -49,12 +50,14 @@ type WriteInput = {
   ids: number | number[];
   values: Record<string, any>;
   mode: ExecutionMode;
+  action_id?: string;
 };
 
 type UnlinkInput = {
   model: string;
   ids: number | number[];
   mode: ExecutionMode;
+  action_id?: string;
 };
 
 type CallKwInput = {
@@ -63,6 +66,7 @@ type CallKwInput = {
   args?: any[];
   kwargs?: Record<string, any>;
   mode: ExecutionMode;
+  action_id?: string;
 };
 
 function assertModelAllowed(model: string): void {
@@ -199,6 +203,58 @@ function summarizeAction(action: string, payload: Record<string, any>): Record<s
   };
 }
 
+function resolveActor(context: ToolExecutionContext): string {
+  const info = context.clientInfo;
+  if (typeof info === 'string' && info.length > 0) {
+    return info;
+  }
+  if (info && typeof info === 'object') {
+    if (typeof info.name === 'string' && info.name.length > 0) {
+      return info.name;
+    }
+    if (typeof info.id === 'string' && info.id.length > 0) {
+      return info.id;
+    }
+    if (typeof info.login === 'string' && info.login.length > 0) {
+      return info.login;
+    }
+  }
+  return context.sessionId;
+}
+
+function formatIso(timestamp?: number): string | undefined {
+  if (typeof timestamp !== 'number') {
+    return undefined;
+  }
+  return new Date(timestamp).toISOString();
+}
+
+function buildPlanMetadata(record: ActionStageRecord<'plan'>) {
+  return {
+    requested_by: record.metadata.requestedBy,
+  };
+}
+
+function buildDryRunMetadata(record: ActionStageRecord<'dry_run'>) {
+  return {
+    requested_by: record.metadata.requestedBy,
+    approved_by: record.metadata.approvedBy,
+    approved_at: formatIso(record.metadata.approvedAt),
+    expires_at: formatIso(record.metadata.expiresAt),
+  };
+}
+
+function buildConfirmMetadata(record: ActionStageRecord<'confirm'>) {
+  return {
+    requested_by: record.metadata.requestedBy,
+    approved_by: record.metadata.approvedBy,
+    approved_at: formatIso(record.metadata.approvedAt),
+    expires_at: formatIso(record.metadata.expiresAt),
+    confirmed_by: record.metadata.confirmedBy,
+    confirmed_at: formatIso(record.metadata.confirmedAt ?? record.timestamp),
+  };
+}
+
 async function checkDryRunAccess(model: string, operation: 'create' | 'write' | 'unlink'): Promise<boolean> {
   try {
     return await odooConnector.checkAccessRights(model, operation);
@@ -220,7 +276,7 @@ export const versionTool: Tool = {
     type: 'object',
     properties: {},
   },
-  execute: async () => {
+  execute: async (_input, _context) => {
     try {
       const version = await odooConnector.getVersion();
       return version;
@@ -237,7 +293,7 @@ export const modelsTool: Tool = {
     type: 'object',
     properties: {},
   },
-  execute: async () => {
+  execute: async (_input, _context) => {
     try {
       return SAFE_MODELS.map((model) => ({
         model,
@@ -284,7 +340,7 @@ export const searchReadTool: Tool = {
       },
     },
   },
-  execute: async ({ model, domain = [], fields, limit = DEFAULT_LIMIT, order }: SearchReadInput) => {
+  execute: async ({ model, domain = [], fields, limit = DEFAULT_LIMIT, order }: SearchReadInput, _context) => {
     try {
       assertModelAllowed(model);
       if (!Array.isArray(domain)) {
@@ -331,7 +387,7 @@ export const getTool: Tool = {
       },
     },
   },
-  execute: async ({ model, id, fields }: GetInput) => {
+  execute: async ({ model, id, fields }: GetInput, _context) => {
     try {
       assertModelAllowed(model);
       if (typeof id !== 'number' || !Number.isInteger(id) || id <= 0) {
@@ -367,7 +423,7 @@ export const countTool: Tool = {
       },
     },
   },
-  execute: async ({ model, domain = [] }: CountInput) => {
+  execute: async ({ model, domain = [] }: CountInput, _context) => {
     try {
       assertModelAllowed(model);
       if (!Array.isArray(domain)) {
@@ -398,30 +454,87 @@ export const createTool: Tool = {
         description: 'Field values for the new record.',
       },
       mode: executionModeSchema,
+      action_id: {
+        type: 'string',
+        description: 'Action identifier returned by plan/dry_run. Required for mode="confirm".',
+      },
     },
   },
-  execute: async ({ model, values, mode }: CreateInput) => {
+  execute: async ({ model, values, mode, action_id }: CreateInput, context) => {
     try {
       assertModelAllowed(model);
       assertModelWritable(model);
       assertExecutionMode(mode);
       const sanitizedValues = sanitizeValues(model, values);
+      const payload = { model, values: sanitizedValues };
+      const actor = resolveActor(context);
 
       if (mode === 'plan') {
-        return summarizeAction('plan:create', { model, values: sanitizedValues });
+        const summary = summarizeAction('plan:create', { model, values: sanitizedValues });
+        const record = context.actionStore.recordPlan({
+          sessionId: context.sessionId,
+          tool: 'odoo.create',
+          payload,
+          result: summary,
+          requestedBy: actor,
+        });
+        return {
+          ...summary,
+          action_id: record.actionId,
+          metadata: buildPlanMetadata(record),
+        };
       }
 
       if (mode === 'dry_run') {
         const allowed = await checkDryRunAccess(model, 'create');
-        return summarizeAction('dry_run:create', {
+        const summary = summarizeAction('dry_run:create', {
           model,
           allowed,
           values: maskRecord(sanitizedValues),
         });
+        const record = context.actionStore.recordDryRun({
+          sessionId: context.sessionId,
+          tool: 'odoo.create',
+          payload,
+          result: summary,
+          approvedBy: actor,
+        });
+        return {
+          ...summary,
+          action_id: record.actionId,
+          metadata: buildDryRunMetadata(record),
+        };
       }
 
+      if (!action_id || typeof action_id !== 'string') {
+        throw new Error('Confirmation requires a valid action_id from dry_run.');
+      }
+
+      const dryRunRecord = context.actionStore.validateConfirm({
+        actionId: action_id,
+        sessionId: context.sessionId,
+        tool: 'odoo.create',
+        payload,
+      });
       const id = await odooConnector.create(model, sanitizedValues);
-      return { id };
+      const record = context.actionStore.recordConfirm({
+        actionId: action_id,
+        sessionId: context.sessionId,
+        tool: 'odoo.create',
+        payload,
+        result: { id },
+        confirmedBy: actor,
+      });
+      return {
+        id,
+        action_id,
+        metadata: buildConfirmMetadata(record),
+        approval: {
+          approved_by: dryRunRecord.metadata.approvedBy,
+          approved_at: formatIso(dryRunRecord.metadata.approvedAt),
+          expires_at: formatIso(dryRunRecord.metadata.expiresAt),
+        },
+      };
     } catch (error: any) {
       return { error: `Failed to execute create: ${error.message}` };
     }
@@ -452,32 +565,89 @@ export const writeTool: Tool = {
         description: 'Field values to update.',
       },
       mode: executionModeSchema,
+      action_id: {
+        type: 'string',
+        description: 'Action identifier returned by plan/dry_run. Required for mode="confirm".',
+      },
     },
   },
-  execute: async ({ model, ids, values, mode }: WriteInput) => {
+  execute: async ({ model, ids, values, mode, action_id }: WriteInput, context) => {
     try {
       assertModelAllowed(model);
       assertModelWritable(model);
       assertExecutionMode(mode);
       const sanitizedValues = sanitizeValues(model, values);
       const targetIds = normalizeIds(ids);
+      const payload = { model, ids: targetIds, values: sanitizedValues };
+      const actor = resolveActor(context);
 
       if (mode === 'plan') {
-        return summarizeAction('plan:write', { model, ids: targetIds, values: sanitizedValues });
+        const summary = summarizeAction('plan:write', { model, ids: targetIds, values: sanitizedValues });
+        const record = context.actionStore.recordPlan({
+          sessionId: context.sessionId,
+          tool: 'odoo.write',
+          payload,
+          result: summary,
+          requestedBy: actor,
+        });
+        return {
+          ...summary,
+          action_id: record.actionId,
+          metadata: buildPlanMetadata(record),
+        };
       }
 
       if (mode === 'dry_run') {
         const allowed = await checkDryRunAccess(model, 'write');
-        return summarizeAction('dry_run:write', {
+        const summary = summarizeAction('dry_run:write', {
           model,
           ids: targetIds,
           allowed,
           values: maskRecord(sanitizedValues),
         });
+        const record = context.actionStore.recordDryRun({
+          sessionId: context.sessionId,
+          tool: 'odoo.write',
+          payload,
+          result: summary,
+          approvedBy: actor,
+        });
+        return {
+          ...summary,
+          action_id: record.actionId,
+          metadata: buildDryRunMetadata(record),
+        };
       }
 
+      if (!action_id || typeof action_id !== 'string') {
+        throw new Error('Confirmation requires a valid action_id from dry_run.');
+      }
+
+      const dryRunRecord = context.actionStore.validateConfirm({
+        actionId: action_id,
+        sessionId: context.sessionId,
+        tool: 'odoo.write',
+        payload,
+      });
       const success = await odooConnector.write(model, targetIds, sanitizedValues);
-      return { success };
+      const confirmRecord = context.actionStore.recordConfirm({
+        actionId: action_id,
+        sessionId: context.sessionId,
+        tool: 'odoo.write',
+        payload,
+        result: { success },
+        confirmedBy: actor,
+      });
+      return {
+        success,
+        action_id,
+        metadata: buildConfirmMetadata(confirmRecord),
+        approval: {
+          approved_by: dryRunRecord.metadata.approvedBy,
+          approved_at: formatIso(dryRunRecord.metadata.approvedAt),
+          expires_at: formatIso(dryRunRecord.metadata.expiresAt),
+        },
+      };
     } catch (error: any) {
       return { error: `Failed to execute write: ${error.message}` };
     }
@@ -504,30 +674,87 @@ export const unlinkTool: Tool = {
         description: 'One or more record IDs to delete.',
       },
       mode: executionModeSchema,
+      action_id: {
+        type: 'string',
+        description: 'Action identifier returned by plan/dry_run. Required for mode="confirm".',
+      },
     },
   },
-  execute: async ({ model, ids, mode }: UnlinkInput) => {
+  execute: async ({ model, ids, mode, action_id }: UnlinkInput, context) => {
     try {
       assertModelAllowed(model);
       assertModelWritable(model);
       assertExecutionMode(mode);
       const targetIds = normalizeIds(ids);
+      const payload = { model, ids: targetIds };
+      const actor = resolveActor(context);
 
       if (mode === 'plan') {
-        return summarizeAction('plan:unlink', { model, ids: targetIds });
+        const summary = summarizeAction('plan:unlink', { model, ids: targetIds });
+        const record = context.actionStore.recordPlan({
+          sessionId: context.sessionId,
+          tool: 'odoo.unlink',
+          payload,
+          result: summary,
+          requestedBy: actor,
+        });
+        return {
+          ...summary,
+          action_id: record.actionId,
+          metadata: buildPlanMetadata(record),
+        };
       }
 
       if (mode === 'dry_run') {
         const allowed = await checkDryRunAccess(model, 'unlink');
-        return summarizeAction('dry_run:unlink', {
+        const summary = summarizeAction('dry_run:unlink', {
           model,
           ids: targetIds,
           allowed,
         });
+        const record = context.actionStore.recordDryRun({
+          sessionId: context.sessionId,
+          tool: 'odoo.unlink',
+          payload,
+          result: summary,
+          approvedBy: actor,
+        });
+        return {
+          ...summary,
+          action_id: record.actionId,
+          metadata: buildDryRunMetadata(record),
+        };
       }
 
+      if (!action_id || typeof action_id !== 'string') {
+        throw new Error('Confirmation requires a valid action_id from dry_run.');
+      }
+
+      const dryRunRecord = context.actionStore.validateConfirm({
+        actionId: action_id,
+        sessionId: context.sessionId,
+        tool: 'odoo.unlink',
+        payload,
+      });
       const success = await odooConnector.unlink(model, targetIds);
-      return { success };
+      const confirmRecord = context.actionStore.recordConfirm({
+        actionId: action_id,
+        sessionId: context.sessionId,
+        tool: 'odoo.unlink',
+        payload,
+        result: { success },
+        confirmedBy: actor,
+      });
+      return {
+        success,
+        action_id,
+        metadata: buildConfirmMetadata(confirmRecord),
+        approval: {
+          approved_by: dryRunRecord.metadata.approvedBy,
+          approved_at: formatIso(dryRunRecord.metadata.approvedAt),
+          expires_at: formatIso(dryRunRecord.metadata.expiresAt),
+        },
+      };
     } catch (error: any) {
       return { error: `Failed to execute unlink: ${error.message}` };
     }
@@ -559,9 +786,13 @@ export const callKwTool: Tool = {
         description: 'Keyword arguments for the method.',
       },
       mode: executionModeSchema,
+      action_id: {
+        type: 'string',
+        description: 'Action identifier returned by plan/dry_run. Required for mode="confirm".',
+      },
     },
   },
-  execute: async ({ model, method, args = [], kwargs = {}, mode }: CallKwInput) => {
+  execute: async ({ model, method, args = [], kwargs = {}, mode, action_id }: CallKwInput, context) => {
     try {
       assertModelAllowed(model);
       const allowedMethods = BUSINESS_METHOD_WHITELIST[model] ?? [];
@@ -575,24 +806,113 @@ export const callKwTool: Tool = {
       if (kwargs === null || typeof kwargs !== 'object' || Array.isArray(kwargs)) {
         throw new Error('Kwargs must be provided as an object.');
       }
+      const payload = { model, method, args, kwargs };
+      const actor = resolveActor(context);
 
       if (mode === 'plan') {
-        return summarizeAction('plan:call_kw', { model, method, args, kwargs });
+        const summary = summarizeAction('plan:call_kw', { model, method, args, kwargs });
+        const record = context.actionStore.recordPlan({
+          sessionId: context.sessionId,
+          tool: 'odoo.call_kw',
+          payload,
+          result: summary,
+          requestedBy: actor,
+        });
+        return {
+          ...summary,
+          action_id: record.actionId,
+          metadata: buildPlanMetadata(record),
+        };
       }
 
       if (mode === 'dry_run') {
         const allowed = await checkDryRunAccess(model, 'write');
-        return summarizeAction('dry_run:call_kw', { model, method, allowed });
+        const summary = summarizeAction('dry_run:call_kw', { model, method, allowed });
+        const record = context.actionStore.recordDryRun({
+          sessionId: context.sessionId,
+          tool: 'odoo.call_kw',
+          payload,
+          result: summary,
+          approvedBy: actor,
+        });
+        return {
+          ...summary,
+          action_id: record.actionId,
+          metadata: buildDryRunMetadata(record),
+        };
       }
 
+      if (!action_id || typeof action_id !== 'string') {
+        throw new Error('Confirmation requires a valid action_id from dry_run.');
+      }
+
+      const dryRunRecord = context.actionStore.validateConfirm({
+        actionId: action_id,
+        sessionId: context.sessionId,
+        tool: 'odoo.call_kw',
+        payload,
+      });
       const result = await odooConnector.callKw<any>(model, method, args, kwargs);
       if (Array.isArray(result)) {
-        return maskRecords(result as Record<string, any>[]);
+        const masked = maskRecords(result as Record<string, any>[]);
+        const confirmRecord = context.actionStore.recordConfirm({
+          actionId: action_id,
+          sessionId: context.sessionId,
+          tool: 'odoo.call_kw',
+          payload,
+          result: masked,
+          confirmedBy: actor,
+        });
+        return {
+          result: masked,
+          action_id,
+          metadata: buildConfirmMetadata(confirmRecord),
+          approval: {
+            approved_by: dryRunRecord.metadata.approvedBy,
+            approved_at: formatIso(dryRunRecord.metadata.approvedAt),
+            expires_at: formatIso(dryRunRecord.metadata.expiresAt),
+          },
+        };
       }
       if (typeof result === 'object' && result !== null) {
-        return maskRecord(result as Record<string, any>);
+        const masked = maskRecord(result as Record<string, any>);
+        const confirmRecord = context.actionStore.recordConfirm({
+          actionId: action_id,
+          sessionId: context.sessionId,
+          tool: 'odoo.call_kw',
+          payload,
+          result: masked,
+          confirmedBy: actor,
+        });
+        return {
+          result: masked,
+          action_id,
+          metadata: buildConfirmMetadata(confirmRecord),
+          approval: {
+            approved_by: dryRunRecord.metadata.approvedBy,
+            approved_at: formatIso(dryRunRecord.metadata.approvedAt),
+            expires_at: formatIso(dryRunRecord.metadata.expiresAt),
+          },
+        };
       }
-      return result;
+      const confirmRecord = context.actionStore.recordConfirm({
+        actionId: action_id,
+        sessionId: context.sessionId,
+        tool: 'odoo.call_kw',
+        payload,
+        result,
+        confirmedBy: actor,
+      });
+      return {
+        result,
+        action_id,
+        metadata: buildConfirmMetadata(confirmRecord),
+        approval: {
+          approved_by: dryRunRecord.metadata.approvedBy,
+          approved_at: formatIso(dryRunRecord.metadata.approvedAt),
+          expires_at: formatIso(dryRunRecord.metadata.expiresAt),
+        },
+      };
     } catch (error: any) {
       return { error: `Failed to execute call_kw: ${error.message}` };
     }
@@ -606,7 +926,7 @@ export const meTool: Tool = {
     type: 'object',
     properties: {},
   },
-  execute: async () => {
+  execute: async (_input, _context) => {
     const uid = odooConnector.getUid();
     if (!uid) {
       return { error: 'Not connected. Cannot get user information.' };
