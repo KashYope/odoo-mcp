@@ -211,8 +211,12 @@ export class OdooConnector {
     return this.execute<T[]>(model, 'search_read', [domain], kwargs);
   }
 
-  public async read<T>(model: string, ids: number[], fields: string[]): Promise<T[]> {
-    return this.execute<T[]>(model, 'read', [ids], { fields });
+  public async read<T>(model: string, ids: number[], fields: string[] = []): Promise<T[]> {
+    const params: any[] = [ids];
+    if (fields.length > 0) {
+      params.push(fields);
+    }
+    return this.execute<T[]>(model, 'read', params);
   }
 
   public async count(model: string, domain: any[]): Promise<number> {

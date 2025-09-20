@@ -134,6 +134,28 @@ describe('OdooConnector', () => {
     assert.equal(connector.getUid(), 99);
   });
 
+  it('passes read fields as positional arguments', async () => {
+    const connectMock = fn<any[], Promise<number>>().mockResolvedValue(7);
+    const executeKwMock = fn<any[], Promise<any>>().mockResolvedValue([{ id: 1 }]);
+    const transport: OdooTransport = {
+      connect: connectMock as any,
+      executeKw: executeKwMock as any,
+      callCommon: fn<any[], Promise<any>>() as any,
+      getUid: fn().mockReturnValue(7) as any,
+    };
+    const connector = new OdooConnector(transport);
+    await connector.connect();
+    const result = await connector.read('res.partner', [1], ['name', 'email']);
+    assert.equal(executeKwMock.mock.calls.length, 1);
+    assert.deepStrictEqual(executeKwMock.mock.calls[0], [
+      'res.partner',
+      'read',
+      [[1], ['name', 'email']],
+      {},
+    ]);
+    assert.deepStrictEqual(result, [{ id: 1 }]);
+  });
+
   it('fails authentication when the uid is not a number', async () => {
     const transport = new JsonRpcTransport({
       baseUrl: 'https://example.odoo.com',
