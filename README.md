@@ -139,21 +139,24 @@ Re-deploy the server after modifying the configuration to pick up changes. No co
 
 ## 🗺️ Roadmap
 
-- [ ] **Phase 1: Core Read & Write Functionality**
-    - [ ] Implement Odoo XML-RPC client.
-    - [ ] Define and implement read-only tools (`search_read`, `get`, `version`).
-    - [ ] Set up basic MCP server.
-    - [ ] Implement write tools (`create`, `write`) with a `dry_run` and confirmation mechanism.
+- [x] **Phase 1: Core Read & Write Functionality**
+    - [x] Implement the authenticated Odoo JSON-RPC client that powers the connector.
+    - [x] Define and implement read-only tools (`search_read`, `get`, `version`).
+    - [x] Set up the MCP server with an in-memory event store.
+    - [x] Implement write tools (`create`, `write`) with a `plan → dry_run → confirm` mechanism.
 - [ ] **Phase 2: Advanced Features & Security**
-    - [ ] Implement `unlink` and `call_kw` with strict whitelisting.
-    - [ ] Add robust PII masking for all responses.
+    - [x] Implement `unlink` and `call_kw` with strict whitelisting.
+    - [x] Add robust PII masking for all responses.
     - [ ] Implement comprehensive logging and rate limiting.
+        - [x] Structured request/response logging with deterministic request identifiers.
+        - [ ] Rate limiting for MCP tool invocations.
 - [ ] **Phase 3: Testing & Deployment**
-    - [ ] Add unit and integration tests against a demo Odoo instance.
+    - [x] Add unit tests that exercise field sanitization and confirmation workflows.
+    - [ ] Add integration tests against a demo Odoo instance.
     - [ ] Dockerize the application for deployment.
     - [ ] Document how to connect the server to an MCP client (e.g., Claude Desktop).
 - [ ] **Phase 4: API Evolution**
-    - [ ] Add support for JSON-RPC as an alternative transport layer.
+    - [x] Add support for JSON-RPC as the primary transport layer.
     - [ ] Prepare for Odoo 20 by designing an abstraction that can accommodate a future REST or GraphQL API.
 
 ## 🤝 Contributing
