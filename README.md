@@ -10,16 +10,21 @@ The goal is to enable an LLM to safely and effectively manage Odoo resources. Th
 
 The data flows from the LLM agent to Odoo and back through the MCP stack:
 
-`LLM Agent ⇄ MCP Client ⇄ Odoo MCP Server ⇄ Odoo Online API (XML-RPC/JSON-RPC)`
+`LLM Agent ⇄ MCP Client ⇄ Odoo MCP Server ⇄ Odoo Online API (JSON-RPC)`
+
+Under the hood the server boots a self-contained [Model Context Protocol](https://modelcontextprotocol.io)
+host with an in-memory event store. No additional services are required to run the connector locally—an MCP
+client can point directly at the provided WebSocket endpoint.
 
 ### 🔑 Key Features
 
-- **Security First**: All operations are governed by a strict security policy, including whitelists for models, fields, and methods. Write operations require a `dry_run` and confirmation flow.
-- **Abstraction Layer**: The connector abstracts the underlying Odoo API (XML-RPC or JSON-RPC), making it resilient to future changes in Odoo's API (e.g., deprecation of RPC services in Odoo 19+).
-- **Controlled Actions**: The connector exposes a set of well-defined tools (e.g., `odoo.search_read`, `odoo.create`) rather than the full, unrestricted API.
-- **LLM-Friendly Interface**: The MCP tools are designed with schemas that make them easy for an LLM to understand and use. PII (Personally Identifiable Information) is masked in responses sent back to the agent.
-- **Auditability**: All requests and responses are logged for security and debugging purposes.
-- **Self-contained MCP runtime**: A lightweight host and event store are bundled so the connector can run without external SDK dependencies.
+- **Security First**: All operations are governed by a strict security policy, including whitelists for models, fields, and methods. Write operations require a `plan → dry_run → confirm` flow before Odoo is mutated.
+- **Execution Modes**: The confirmation flow is implemented natively in the tools: agents must stage an action (`plan`), request human approval (`dry_run`), and finally execute (`confirm`) with the returned `action_id`.
+- **Abstraction Layer**: The connector talks to Odoo exclusively through the JSON-RPC transport, hiding authentication, retries, and error handling details from the agent.
+- **Controlled Actions**: Only a curated list of MCP tools (e.g., `odoo.search_read`, `odoo.create`) is exposed. Each tool validates models, fields, and arguments against the local whitelist before hitting Odoo.
+- **LLM-Friendly Interface**: The MCP tools declare JSON schemas that guide the agent. Responses automatically mask PII (Personally Identifiable Information) by obscuring configured fields.
+- **Auditability**: All requests to Odoo are logged with deterministic request identifiers, and the in-memory action store tracks who planned, approved, and confirmed every mutation.
+- **Self-contained MCP runtime**: A lightweight host and event store are bundled so the connector can run without external SDK dependencies. Swapping in a persistent event store (e.g., Postgres) only requires updating the host bootstrap.
 
 ## 🚀 Getting Started
 
@@ -90,33 +95,47 @@ tests.
 
 ## 🧰 Implemented Tools
 
-The following MCP tools are available:
+The following MCP tools ship with the connector. Parameters marked with `*` are required.
 
-### Read Operations
+| Tool | Category | Notable Parameters | Execution Modes |
+|------|----------|--------------------|-----------------|
+| `odoo.version` | Read | _(none)_ | `plan` not required — fire-and-forget |
+| `odoo.models` | Read | _(none)_ | `plan` not required |
+| `odoo.me` | Read | _(none)_ | `plan` not required |
+| `odoo.search_read` | Read | `model*`, `domain`, `fields`, `limit`, `order` | `plan` not required |
+| `odoo.get` | Read | `model*`, `id*`, `fields` | `plan` not required |
+| `odoo.count` | Read | `model*`, `domain` | `plan` not required |
+| `odoo.create` | Write | `model*`, `values*`, `mode*`, `action_id` | `plan → dry_run → confirm` |
+| `odoo.write` | Write | `model*`, `ids*`, `values*`, `mode*`, `action_id` | `plan → dry_run → confirm` |
+| `odoo.unlink` | Write | `model*`, `ids*`, `mode*`, `action_id` | `plan → dry_run → confirm` |
+| `odoo.call_kw` | Business | `model*`, `method*`, `args`, `kwargs`, `mode*`, `action_id` | `plan → dry_run → confirm` |
 
-- `odoo.version()`: Get the Odoo server version.
-- `odoo.me()`: Get information about the current user.
-- `odoo.models()`: List the whitelisted models available for interaction.
-- `odoo.search_read(model, domain, fields, limit, order)`: Search for and read records.
-- `odoo.get(model, id, fields)`: Get a single record by its ID.
-- `odoo.count(model, domain)`: Count the number of records matching a domain.
+When a tool supports execution modes, the agent must:
 
-### Write Operations (Requires Confirmation)
+1. Call the tool with `mode="plan"` to receive a summary and `action_id`.
+2. Re-play the tool with `mode="dry_run"` to request approval. The response includes approval metadata and masks PII fields.
+3. Finally execute with `mode="confirm"` and the original `action_id`. The action store enforces that the payload matches the approved dry-run before calling Odoo.
 
-- `odoo.create(model, values)`: Create a new record.
-- `odoo.write(model, ids, values)`: Update one or more records.
-- `odoo.unlink(model, ids)`: Delete one or more records.
-
-### Business Operations (Requires Confirmation)
-
-- `odoo.call_kw(model, method, args, kwargs)`: Call a whitelisted business method on a model.
+The in-memory store records who initiated and approved each step using the MCP client metadata. Timestamps are returned in ISO-8601 format for auditing.
 
 ## 🛡️ Security & Governance
 
-- **Whitelisting**: Only pre-approved models, fields, and methods can be accessed. This configuration is managed in the server.
-- **Confirmation Flow**: All write operations (`create`, `write`, `unlink`) and sensitive business logic calls (`call_kw`) require a confirmation step from the user. The agent must first generate a plan, which is then approved.
-- **PII Masking**: The server is responsible for filtering or masking Personally Identifiable Information before sending data back to the LLM agent.
-- **Logging**: All API calls are logged with idempotency keys to ensure safe retries.
+- **Whitelisting**: Only pre-approved models, fields, and methods can be accessed. The `src/config.ts` file defines the `ALLOWED_MODELS`, `WRITABLE_MODELS`, and `BUSINESS_METHOD_WHITELIST` lists used by the tools.
+- **Confirmation Flow**: All write operations (`create`, `write`, `unlink`) and sensitive business logic calls (`call_kw`) require the confirmation sequence. Each stage records the actor that initiated it, and confirmation refuses to run if the payload changed since the dry run.
+- **PII Masking**: The connector masks Personally Identifiable Information before returning it to the agent. Configure the `PII_FIELDS` array in `src/config.ts` to extend or shrink the masked fields.
+- **Logging**: Every call to Odoo is logged with a deterministic SHA-256 request fingerprint, making it easy to trace requests end-to-end.
+- **Access Verification**: Dry-run stages call `checkAccessRights` to verify the current service account can perform the requested write before confirmation.
+
+### Configuration Reference
+
+You can tailor what the agent can do by editing `src/config.ts`:
+
+- **`ALLOWED_MODELS`** – defines the fields exposed for each model and whether it is writable.
+- **`BUSINESS_METHOD_WHITELIST`** – enumerates which model methods are callable via `odoo.call_kw`.
+- **`PII_FIELDS`** – lists the field names that should be masked in responses.
+- **`MAX_LIMIT` / `DEFAULT_LIMIT`** – cap pagination for read operations.
+
+Re-deploy the server after modifying the configuration to pick up changes. No code modifications are required for typical governance tweaks.
 
 ## 🗺️ Roadmap
 
